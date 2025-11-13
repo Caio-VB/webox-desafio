@@ -22,15 +22,24 @@ services:
       context: ./etl
     container_name: webox-etl
     depends_on:
-      db:
-        condition: service_healthy
+      - db
     environment:
-      - DATABASE_URL=postgresql+psycopg2://webox:weboxpass@db:5432/weboxdb
-      - INBOX_DIR=/data/inbox
-      - CLIENTE_ID=cliente_demo
+      DATABASE_URL: postgresql+psycopg2://webox:weboxpass@db:5432/weboxdb
+      INBOX_DIR: /data/inbox
+      CLIENTE_ID: cliente_demo
     volumes:
       - ./data/inbox:/data/inbox
 
+  api:
+    build:
+      context: ./api
+    container_name: webox-api
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: postgresql+psycopg2://webox:weboxpass@db:5432/weboxdb
+    ports:
+      - "8000:8000"
 
 volumes:
   db_data:
