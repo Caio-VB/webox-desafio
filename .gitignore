@@ -1,0 +1,20 @@
+# venv
+.venv/
+env/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Docker
+*.log
+
+# Sistema
+.DS_Store
+Thumbs.db
