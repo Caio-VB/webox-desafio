@@ -3,16 +3,16 @@ services:
     image: postgres:16
     container_name: webox-db
     environment:
-      POSTGRES_USER: webox
-      POSTGRES_PASSWORD: weboxpass
-      POSTGRES_DB: weboxdb
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
       - db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U webox -d weboxdb"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -24,10 +24,10 @@ services:
     depends_on:
       - db
     environment:
-      DATABASE_URL: postgresql+psycopg2://webox:weboxpass@db:5432/weboxdb
-      INBOX_DIR: /data/inbox
-      CLIENTE_ID: cliente_demo
-      POLL_INTERVAL: "30"   # segundos
+      DATABASE_URL: ${DATABASE_URL}
+      INBOX_DIR: ${ETL_INBOX_DIR}
+      CLIENTE_ID: ${ETL_CLIENTE_ID}
+      POLL_INTERVAL: "${ETL_POLL_INTERVAL}" # segundos
     volumes:
       - ./data/inbox:/data/inbox
 
@@ -38,7 +38,8 @@ services:
     depends_on:
       - db
     environment:
-      DATABASE_URL: postgresql+psycopg2://webox:weboxpass@db:5432/weboxdb
+      DATABASE_URL: ${DATABASE_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
     ports:
       - "9000:9000"
 
@@ -49,7 +50,7 @@ services:
     depends_on:
       - agent
     environment:
-      AGENT_URL: http://agent:9000/run-agent
+      AGENT_URL: ${AGENT_URL}
     ports:
       - "8000:8000"
 

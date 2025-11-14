@@ -1,20 +1,27 @@
-# venv
+# Ambientes virtuais
 .venv/
-env/
 venv/
+env/
 
-# Python cache
+# Cache do Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 
-# IDE / editor
+# Config de IDE/Editor
 .vscode/
 .idea/
 
-# Docker
-*.log
-
-# Sistema
+# Arquivos de sistema
 .DS_Store
 Thumbs.db
+
+# Logs
+*.log
+
+# Arquivos de ambiente (NÃO versionar secrets)
+.env
+
+# Outros
+*.sqlite3

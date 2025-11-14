@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir \
     "uvicorn[standard]" \
     pydantic \
     sqlalchemy \
-    psycopg2-binary
+    psycopg2-binary \
+    openai
 
 COPY main.py .
 
