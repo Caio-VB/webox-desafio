@@ -30,7 +30,6 @@ app = FastAPI(title="WeBox Agent Service")
 
 class AskRequest(BaseModel):
     question: str
-    cliente_id: str = "cliente_demo"
 
 
 class AgentResponse(BaseModel):
@@ -43,38 +42,140 @@ class AgentResponse(BaseModel):
 # ----------------------------------------------------------------
 
 
-def decide_sql(question: str, cliente_id: str) -> Tuple[str, Dict[str, Any]]:
+def get_table_schema(table_name: str = "faturamento") -> list[dict]:
+    """
+    Lê o schema real da tabela no Postgres (colunas e tipos).
+    Não assume nada além do nome da tabela.
+    """
+    sql = text(
+        """
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_name = :table
+        ORDER BY ordinal_position
+        """
+    )
+    with engine.begin() as conn:
+        result = conn.execute(sql, {"table": table_name})
+        return [
+            {"name": row[0], "type": row[1]}
+            for row in result.fetchall()
+        ]
+
+
+def get_column_samples(
+    table_name: str,
+    schema: list[dict],
+    max_samples: int = 5,
+) -> dict[str, list[str]]:
+    """
+    Para cada coluna textual da tabela, busca alguns valores distintos
+    para dar contexto ao LLM. Não assume nome de coluna (status, situacao, etc).
+    """
+    samples: dict[str, list[str]] = {}
+
+    text_types = {
+        "character varying",
+        "text",
+        "varchar",
+        "char",
+    }
+
+    with engine.begin() as conn:
+        for col in schema:
+            col_name = col["name"]
+            col_type = col["type"]
+
+            if col_type not in text_types:
+                continue
+
+            # Atenção: col_name vem do information_schema, não de input do usuário.
+            sql = text(
+                f"""
+                SELECT DISTINCT {col_name}
+                FROM {table_name}
+                WHERE {col_name} IS NOT NULL
+                LIMIT :limit
+                """
+            )
+            result = conn.execute(sql, {"limit": max_samples})
+            values = [str(row[0]) for row in result.fetchall() if row[0] is not None]
+
+            if values:
+                samples[col_name] = values
+
+    return samples
+
+
+
+def decide_sql(question: str) -> Tuple[str, Dict[str, Any]]:
     """
     Usa um LLM (OpenAI) para gerar SQL a partir da pergunta.
-    Aqui estamos simulando o comportamento de um agente A2A/MCP
-    que decide qual query disparar.
+
+    Não assume nomes específicos de colunas como 'status' ou 'valor_total'.
+    Em vez disso:
+      - lê o schema real da tabela de faturamento (colunas + tipos),
+      - lê alguns valores de exemplo para colunas textuais,
+      - passa isso tudo para o LLM escolher o que faz sentido usar.
     """
+    table_name = os.getenv("FATURAMENTO_TABLE", "faturamento")
+
+    # 1) Schema real da tabela
+    schema = get_table_schema(table_name)
+
+    # 2) Amostras de valores das colunas textuais
+    samples = get_column_samples(table_name, schema, max_samples=5)
+
+    # 3) Monta descrição de schema + exemplos para o prompt
+    col_lines = []
+    for col in schema:
+        name = col["name"]
+        col_type = col["type"]
+        line = f"- {name} ({col_type})"
+        if name in samples:
+            example_values = ", ".join(samples[name][:5])
+            line += f" | exemplos de valores: {example_values}"
+        col_lines.append(line)
+
+    schema_description = "\n".join(col_lines) if col_lines else "(sem colunas?)"
+
     system_prompt = """
 Você é um assistente que gera consultas SQL para um banco PostgreSQL.
 
-Esquema relevante:
+Você tem acesso a UMA tabela principal, que representa dados de faturamento
+consolidados a partir de arquivos Excel.
 
-Tabela faturamento:
-- id (serial, PK)
-- cliente_id (text)
-- arquivo_nome (text)
-- linha_numero (integer)
-- data_emissao (date)
-- data_vencimento (date)
-- valor_total (numeric)
-- status (text)
-- raw (jsonb)
-- created_at (timestamp)
+Regras IMPORTANTES:
+- Use APENAS a tabela informada pelo sistema (não invente outras tabelas).
+- Use APENAS as colunas e tipos informados pelo sistema (não invente colunas).
+- Use APENAS valores que façam sentido com base nos exemplos fornecidos.
+- Não use SELECT *; selecione apenas as colunas necessárias.
+- Não use DELETE, UPDATE ou INSERT; apenas SELECT.
+- Para perguntas sobre "quanto eu faturei", "quanto tenho a receber",
+  "total de valor" etc., escolha colunas NUMÉRICAS para somar.
+- Para perguntas sobre "status", "situação", "em aberto", "pago" etc.,
+  escolha colunas TEXTUAIS cujos exemplos de valores pareçam representar isso.
+- Se a pergunta mencionar um cliente ou identificador específico e houver
+  uma coluna compatível com isso (pelo nome ou pelos valores), use-a
+  em um filtro WHERE adequado.
+- Responda APENAS com a SQL, sem explicações, sem markdown.
+""".strip()
 
-Regras:
-- Sempre filtre por cliente_id usando parâmetro nomeado :cliente_id.
-- Nunca use DELETE ou UPDATE, apenas SELECT.
-- Responda apenas com a SQL, sem explicação, sem markdown.
-    """.strip()
+    user_prompt = f"""
+A tabela disponível se chama {table_name}.
 
-    user_prompt = f"Pergunta do usuário: {question}\nGere apenas a SQL correspondente."
+Esquema da tabela (colunas, tipos e exemplos de valores):
 
-    # Deixa o erro "subir" e ser tratado pelo run_agent
+{schema_description}
+
+Pergunta do usuário:
+{question}
+
+Com base nisso, gere apenas uma consulta SQL em PostgreSQL que responda à pergunta.
+Use SOMENTE as colunas listadas acima e, se precisar filtrar por valores,
+use apenas valores compatíveis com os exemplos fornecidos.
+""".strip()
+
     chat = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -85,26 +186,16 @@ Regras:
     )
     sql = chat.choices[0].message.content.strip()
 
-    # --- Sanitização do retorno do LLM ---
-
-    # 1) remover cercas de markdown ```...``` se existirem
+    # Sanitização (``` etc.)
     if sql.startswith("```"):
         lines = sql.splitlines()
-
-        # remove primeira linha (``` ou ```sql)
         if lines:
             lines = lines[1:]
-
-        # remove última linha se for ```
         if lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
-
         sql = "\n".join(lines).strip()
 
-    # 2) normalizar estilo de parâmetro para :cliente_id
-    sql = sql.replace("%(cliente_id)s", ":cliente_id")
-
-    params = {"cliente_id": cliente_id}
+    params: Dict[str, Any] = {}
     return sql, params
 
 
@@ -112,7 +203,8 @@ Regras:
 # Camada "tool" de banco (pensar como uma MCP tool)
 # ----------------------------------------------------------------
 
-def db_mcp_tool(sql: str, params: Dict[str, Any]) -> Dict[str, Any]:
+
+def db_mcp_tool(sql: str, params: Dict[str, Any]) -> list[Dict[str, Any]]:
     """
     Esta função encapsula a chamada ao banco e representa,
     conceitualmente, uma tool de banco de dados no MCP/A2A.
@@ -122,117 +214,72 @@ def db_mcp_tool(sql: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """
     with engine.begin() as conn:
         result = conn.execute(text(sql), params)
-        row = result.mappings().first() or {}
-    return dict(row)
+        rows = result.mappings().all()
+    return [dict(r) for r in rows]
 
 
-def build_answer(question: str, row: Dict[str, Any], sql: str, cliente_id: str) -> str:
+
+def generate_answer_with_llm(question: str, sql: str, rows: list[Dict[str, Any]]) -> str:
     """
-    Monta uma resposta em linguagem natural com base no resultado da query.
-    Cobre:
-      - total (mês passado / total geral)
-      - total_faturado (quando LLM usa esse alias)
-      - qtd (contagem de registros)
-      - top5 (cinco maiores notas)
-      - último ciclo (total + qtd + período)
+    Usa o LLM para transformar o resultado da query em uma resposta de negócio.
+
+    rows: lista de linhas retornadas pela SQL (cada linha é um dict).
+    Pode estar vazia (nenhum resultado), ter uma linha (agregação)
+    ou várias linhas (lista, top N, etc.).
     """
-    # Caso: cinco maiores notas (top5)
-    if "top5" in row:
-        top5 = row["top5"]
-        if top5 is None:
-            return (
-                f"Para a pergunta '{question}', não encontrei notas fiscais "
-                f"para o cliente {cliente_id} com esse filtro."
-            )
+    system_prompt = """
+Você é um assistente de negócios que explica resultados de consultas SQL
+sobre uma tabela de faturamento.
 
-        # Se vier como string, tenta converter de JSON
-        if isinstance(top5, str):
-            try:
-                top5 = json.loads(top5)
-            except Exception:
-                return (
-                    f"Para a pergunta '{question}', obtive o resultado: {row}. "
-                    f"(SQL usada: {sql})"
-                )
+Você recebe:
+- a pergunta original do usuário (em português),
+- a SQL que foi executada em um banco PostgreSQL,
+- o resultado dessa SQL em formato JSON (uma lista de objetos, cada objeto é uma linha).
 
-        if not top5:
-            return (
-                f"Para a pergunta '{question}', não encontrei notas fiscais "
-                f"para o cliente {cliente_id}."
-            )
+Seu trabalho:
+- Interpretar a pergunta e o resultado.
+- Se a pergunta pede totais, use os campos numéricos agregados (por exemplo, SUM).
+- Se a pergunta pede listas (como "cinco maiores notas"), descreva os principais itens.
+- Se a lista estiver vazia, explique que não há dados que atendam ao filtro.
+- Monte uma resposta em português, clara e curta (2 a 5 frases no máximo).
+- Não repita a SQL na resposta final.
+- Não use markdown, apenas texto simples.
+""".strip()
 
-        linhas = []
-        for i, nf in enumerate(top5, start=1):
-            data = nf.get("data_emissao")
-            valor = nf.get("valor_total")
-            status_nf = nf.get("status")
-            linhas.append(
-                f"{i}. data={data}, valor=R$ {float(valor):.2f}, status={status_nf}"
-            )
-        lista = "\n".join(linhas)
-        return (
-            f"Para a pergunta '{question}', estas são as cinco maiores notas fiscais "
-            f"do cliente {cliente_id}:\n{lista}"
-        )
+    # Serializa as linhas para JSON
+    rows_json = json.dumps(rows, default=str, ensure_ascii=False)
 
-    # Caso: último ciclo (total + qtd + período)
-    if "total" in row and "inicio" in row and "fim" in row:
-        qtd = int(row.get("qtd") or 0)
-        total = float(row.get("total") or 0)
-        inicio = row.get("inicio")
-        fim = row.get("fim")
+    user_prompt = f"""
+Pergunta do usuário:
+{question}
 
-        if qtd == 0:
-            return (
-                f"Para a pergunta '{question}', não encontrei faturamento recente "
-                f"para o cliente {cliente_id}."
-            )
+SQL executada:
+{sql}
 
-        return (
-            f"Para a pergunta '{question}', no último ciclo de faturamento do cliente "
-            f"{cliente_id} (de {inicio} até {fim}), o faturamento foi de "
-            f"R$ {total:.2f} em {qtd} registros."
-        )
+Resultado da SQL (JSON - lista de linhas):
+{rows_json}
 
-    # Caso: total (geral, mês passado, etc.)
-    if "total" in row:
-        total = row["total"]
-        if total is None:
-            return (
-                f"Para a pergunta '{question}', não encontrei faturamento "
-                f"para o cliente {cliente_id} com esse filtro."
-            )
-        total = float(total)
-        return (
-            f"Para a pergunta '{question}', o faturamento total do cliente "
-            f"{cliente_id} é de R$ {total:.2f}."
-        )
+Com base nisso, responda ao usuário de forma objetiva, em português.
+""".strip()
 
-    # Caso: total_faturado (quando LLM gera esse alias)
-    if "total_faturado" in row:
-        total = row["total_faturado"]
-        if total is None:
-            return (
-                f"Para a pergunta '{question}', não encontrei faturamento "
-                f"para o cliente {cliente_id} com esse filtro."
-            )
-        total = float(total)
-        return (
-            f"Para a pergunta '{question}', o faturamento total do cliente "
-            f"{cliente_id} é de R$ {total:.2f}."
-        )
+    chat = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0,
+    )
 
-    # Caso: qtd (contagem)
-    if "qtd" in row:
-        qtd = int(row["qtd"] or 0)
-        return (
-            f"Para a pergunta '{question}', encontrei {qtd} registros de faturamento "
-            f"para o cliente {cliente_id}."
-        )
+    answer = chat.choices[0].message.content.strip()
+    return answer
 
-    # Fallback genérico
+
+def build_answer(question: str, rows: list[Dict[str, Any]], sql: str) -> str:
+    # Fallback bem genérico, usado só se a LLM de resposta falhar
     return (
-        f"Para a pergunta '{question}', obtive o resultado: {row}. "
+        f"Para a pergunta '{question}', obtive {len(rows)} linha(s) como resultado. "
+        f"Primeiras linhas: {rows[:3]}. "
         f"(SQL usada: {sql})"
     )
 
@@ -245,12 +292,11 @@ def build_answer(question: str, row: Dict[str, Any], sql: str, cliente_id: str) 
 def run_agent(req: AskRequest):
     """
     Agent-service:
-    - recebe question + cliente_id
+    - recebe question
     - se LLM estiver disponível, gera SQL e chama a "tool" de banco
-    - se LLM não estiver disponível, responde de forma elegante
+    - em seguida, usa o LLM novamente para traduzir o resultado em resposta de negócio
     """
     if not USE_LLM:
-        # Modo "sem IA": arquitetura está no ar, mas o agente está desativado.
         mensagem = (
             "Desculpe, o módulo de IA não está disponível no momento, "
             "então não consigo gerar uma resposta baseada nos seus dados. "
@@ -258,23 +304,30 @@ def run_agent(req: AskRequest):
         )
         return AgentResponse(answer=mensagem, debug_sql=None)
 
-    # Modo normal: IA ativa, gera SQL e consulta banco
+    # 1) Gera SQL a partir da pergunta
     try:
-        sql, params = decide_sql(req.question, req.cliente_id)
+        sql, params = decide_sql(req.question)
     except Exception as e:
-        # Se der algum erro estranho na decisão de SQL, falha de forma clara
         raise HTTPException(
             status_code=500,
             detail=f"Erro ao decidir SQL com o agente de IA: {e}",
         )
 
+    # 2) Executa a SQL via tool de banco (MCP-like)
     try:
-        row = db_mcp_tool(sql, params)
+        rows = db_mcp_tool(sql, params)
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Erro ao executar SQL: {e}",
         )
 
-    answer = build_answer(req.question, row, sql, req.cliente_id)
+    # 3) Usa LLM para gerar a resposta de negócio
+    try:
+        answer = generate_answer_with_llm(req.question, sql, rows)
+    except Exception as e:
+        print(f"[AGENT] Erro ao gerar resposta com LLM, usando fallback: {e}")
+        answer = build_answer(req.question, rows, sql)
+
     return AgentResponse(answer=answer, debug_sql=sql)
+
