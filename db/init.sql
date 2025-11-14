@@ -1,19 +1,13 @@
--- Tabela-mãe de faturamento
-CREATE TABLE IF NOT EXISTS faturamento (
+-- Tabela-mãe
+CREATE TABLE faturamento (
     id SERIAL PRIMARY KEY,
     cliente_id TEXT NOT NULL,
     arquivo_nome TEXT NOT NULL,
     linha_numero INTEGER NOT NULL,
-
-    data_emissao DATE NULL,
-    data_vencimento DATE NULL,
-    valor_total NUMERIC(18,2) NULL,
-    status TEXT NULL,
-
     raw JSONB NOT NULL,
-
-    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
 
 -- Histórico dos jobs de ETL
 CREATE TABLE IF NOT EXISTS etl_jobs (

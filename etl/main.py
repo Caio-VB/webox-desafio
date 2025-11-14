@@ -85,21 +85,12 @@ def run_etl_for_file(file_path: Path, cliente_id: str):
         for idx, row in df.iterrows():
             raw = row.to_dict()
 
-            data_emissao = raw.get("data_emissao")
-            data_vencimento = raw.get("data_vencimento")
-            valor_total = raw.get("valor_total")
-            status_nf = raw.get("status") or raw.get("situacao")
-
             records.append(
                 {
                     "cliente_id": cliente_id,
                     "arquivo_nome": arquivo_nome,
                     "linha_numero": idx + 1,
-                    "data_emissao": data_emissao,
-                    "data_vencimento": data_vencimento,
-                    "valor_total": valor_total,
-                    "status": status_nf,
-                    # Enviamos como JSON string e fazemos CAST no SQL
+                    # linha inteira do Excel vai para o JSONB
                     "raw": json.dumps(raw, default=str),
                 }
             )
@@ -111,20 +102,12 @@ def run_etl_for_file(file_path: Path, cliente_id: str):
                     cliente_id,
                     arquivo_nome,
                     linha_numero,
-                    data_emissao,
-                    data_vencimento,
-                    valor_total,
-                    status,
                     raw
                 )
                 VALUES (
                     :cliente_id,
                     :arquivo_nome,
                     :linha_numero,
-                    :data_emissao,
-                    :data_vencimento,
-                    :valor_total,
-                    :status,
                     CAST(:raw AS JSONB)
                 )
                 """
