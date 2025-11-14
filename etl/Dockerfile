@@ -17,4 +17,4 @@ RUN pip install --no-cache-dir \
 
 COPY main.py .
 
-CMD ["python", "main.py"]
+CMD ["python", "-u", "main.py"]

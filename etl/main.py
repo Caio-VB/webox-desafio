@@ -1,10 +1,12 @@
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 from sqlalchemy import create_engine, text
+
+import time
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -12,6 +14,25 @@ DATABASE_URL = os.getenv(
 )
 
 engine = create_engine(DATABASE_URL)
+
+
+def get_processados(cliente_id: str) -> set[str]:
+    """
+    Busca no banco os arquivos já processados com sucesso para esse cliente.
+    Assim evitamos processar o mesmo arquivo várias vezes.
+    """
+    sql = text(
+        """
+        SELECT DISTINCT arquivo_nome
+        FROM etl_jobs
+        WHERE cliente_id = :cliente_id
+          AND status = 'success'
+        """
+    )
+    with engine.begin() as conn:
+        result = conn.execute(sql, {"cliente_id": cliente_id})
+        nomes = {row[0] for row in result.fetchall()}
+    return nomes
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -30,7 +51,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_etl_for_file(file_path: Path, cliente_id: str):
-    started_at = datetime.utcnow()
+    started_at = datetime.now(timezone.utc)
     arquivo_nome = file_path.name
     status = "success"
     rows_imported = 0
@@ -103,7 +124,7 @@ def run_etl_for_file(file_path: Path, cliente_id: str):
         print(f"[ETL] Erro ao processar {arquivo_nome}: {error_message}")
 
     finally:
-        finished_at = datetime.utcnow()
+        finished_at = datetime.now(timezone.utc)
 
         with engine.begin() as conn:
             conn.execute(
@@ -149,16 +170,36 @@ def run_etl_for_file(file_path: Path, cliente_id: str):
 def main():
     inbox_dir = Path(os.getenv("INBOX_DIR", "/data/inbox"))
     cliente_id = os.getenv("CLIENTE_ID", "cliente_demo")
+    poll_interval = int(os.getenv("POLL_INTERVAL", "30"))
 
-    print(f"[ETL] Lendo arquivos de {inbox_dir}")
-    excel_files = list(inbox_dir.glob("*.xlsx"))
+    print(f"[ETL] Iniciando watcher em {inbox_dir} para cliente {cliente_id}")
+    print(f"[ETL] Intervalo de varredura: {poll_interval} segundos")
 
-    if not excel_files:
-        print(f"[ETL] Nenhum arquivo .xlsx encontrado em {inbox_dir}")
-        return
+    while True:
+        try:
+            if not inbox_dir.exists():
+                print(f"[ETL] Diretório {inbox_dir} não existe, aguardando...")
+            else:
+                todos_arquivos = list(inbox_dir.glob("*.xlsx"))
+                if not todos_arquivos:
+                    print(f"[ETL] Nenhum .xlsx encontrado em {inbox_dir}")
 
-    for file in excel_files:
-        run_etl_for_file(file, cliente_id)
+                processados = get_processados(cliente_id)
+                novos = [f for f in todos_arquivos if f.name not in processados]
+
+                if novos:
+                    print(f"[ETL] Encontrados {len(novos)} arquivos novos.")
+                else:
+                    print("[ETL] Nenhum arquivo novo para processar.")
+
+                for file in novos:
+                    run_etl_for_file(file, cliente_id)
+
+        except Exception as e:
+            print(f"[ETL] Erro inesperado no loop principal: {e}")
+
+        print(f"[ETL] Aguardando {poll_interval} segundos para nova varredura...")
+        time.sleep(poll_interval)
 
 
 if __name__ == "__main__":
