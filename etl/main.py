@@ -16,21 +16,39 @@ DATABASE_URL = os.getenv(
 engine = create_engine(DATABASE_URL)
 
 
-def get_processados(cliente_id: str) -> set[str]:
+def extract_cliente_id(file_path: Path, default_cliente_id: str) -> str:
     """
-    Busca no banco os arquivos já processados com sucesso para esse cliente.
+    Extrai o cliente_id do nome do arquivo.
+
+    Convenção:
+      <cliente_id>__qualquer_coisa.xlsx
+
+    Exemplos:
+      cliente_acme__faturamento_2025-01.xlsx -> cliente_acme
+      grupo_x__jan2025.xlsx                  -> grupo_x
+
+    Se não encontrar "__" no nome, usa o default_cliente_id.
+    """
+    name = file_path.stem  # nome sem extensão
+    if "__" in name:
+        return name.split("__", 1)[0]
+    return default_cliente_id
+
+
+def get_processados() -> set[str]:
+    """
+    Busca no banco os arquivos já processados com sucesso (qualquer cliente).
     Assim evitamos processar o mesmo arquivo várias vezes.
     """
     sql = text(
         """
         SELECT DISTINCT arquivo_nome
         FROM etl_jobs
-        WHERE cliente_id = :cliente_id
-          AND status = 'success'
+        WHERE status = 'success'
         """
     )
     with engine.begin() as conn:
-        result = conn.execute(sql, {"cliente_id": cliente_id})
+        result = conn.execute(sql)
         nomes = {row[0] for row in result.fetchall()}
     return nomes
 
@@ -169,10 +187,11 @@ def run_etl_for_file(file_path: Path, cliente_id: str):
 
 def main():
     inbox_dir = Path(os.getenv("INBOX_DIR", "/data/inbox"))
-    cliente_id = os.getenv("CLIENTE_ID", "cliente_demo")
+    default_cliente_id = os.getenv("CLIENTE_ID", "cliente_demo")
     poll_interval = int(os.getenv("POLL_INTERVAL", "30"))
 
-    print(f"[ETL] Iniciando watcher em {inbox_dir} para cliente {cliente_id}")
+    print(f"[ETL] Iniciando watcher em {inbox_dir}")
+    print(f"[ETL] Cliente padrão (fallback): {default_cliente_id}")
     print(f"[ETL] Intervalo de varredura: {poll_interval} segundos")
 
     while True:
@@ -184,7 +203,7 @@ def main():
                 if not todos_arquivos:
                     print(f"[ETL] Nenhum .xlsx encontrado em {inbox_dir}")
 
-                processados = get_processados(cliente_id)
+                processados = get_processados()
                 novos = [f for f in todos_arquivos if f.name not in processados]
 
                 if novos:
@@ -193,6 +212,8 @@ def main():
                     print("[ETL] Nenhum arquivo novo para processar.")
 
                 for file in novos:
+                    cliente_id = extract_cliente_id(file, default_cliente_id)
+                    print(f"[ETL] Arquivo {file.name} será processado para cliente {cliente_id}")
                     run_etl_for_file(file, cliente_id)
 
         except Exception as e:

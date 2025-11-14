@@ -17,6 +17,9 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Arquivos de teste
+data/inbox/*.xlsx
+
 # Logs
 *.log
 

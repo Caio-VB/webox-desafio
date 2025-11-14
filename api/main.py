@@ -11,7 +11,6 @@ app = FastAPI(title="WeBox Faturamento API")
 
 class AskRequest(BaseModel):
     question: str
-    cliente_id: str = "cliente_demo"
 
 
 class AskResponse(BaseModel):
@@ -49,7 +48,6 @@ def ask(req: AskRequest):
         )
 
     data = resp.json()
-    # Garantir campos esperados
     return AskResponse(
         answer=data.get("answer", ""),
         debug_sql=data.get("debug_sql"),
