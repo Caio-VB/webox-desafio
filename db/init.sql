@@ -1,13 +1,12 @@
--- Tabela-mãe
+-- Tabela de faturamento com metadados fixos.
+-- As colunas de dados (do Excel) serão adicionadas dinamicamente pelo ETL.
 CREATE TABLE faturamento (
     id SERIAL PRIMARY KEY,
     cliente_id TEXT NOT NULL,
     arquivo_nome TEXT NOT NULL,
     linha_numero INTEGER NOT NULL,
-    raw JSONB NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
-
 
 -- Histórico dos jobs de ETL
 CREATE TABLE IF NOT EXISTS etl_jobs (
