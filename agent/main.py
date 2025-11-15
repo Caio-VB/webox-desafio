@@ -8,10 +8,9 @@ from sqlalchemy import create_engine, text
 
 # --- Configuração de banco (tool MCP de banco, na prática) ---
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg2://webox:weboxpass@db:5432/weboxdb",
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL não configurada no ambiente.")
 
 engine = create_engine(DATABASE_URL)
 
@@ -110,6 +109,31 @@ def get_column_samples(
 # ----------------------------------------------------------------
 # Camada de decisão de SQL
 # ----------------------------------------------------------------
+
+
+DANGEROUS_KEYWORDS = [
+    "insert", "update", "delete", "drop", "alter",
+    "truncate", "create", "grant", "revoke", "execute", "copy"
+]
+
+def is_safe_sql(sql: str) -> bool:
+    s = sql.strip().lower()
+
+    # só permite SELECT
+    if not s.startswith("select"):
+        return False
+
+    # só uma instrução (no máximo um ';' no final)
+    if ";" in s[:-1]:
+        return False
+
+    # corta comentários pra não esconder coisa
+    for kw in DANGEROUS_KEYWORDS:
+        if kw in s:
+            return False
+
+    return True
+
 
 
 def decide_sql(question: str) -> Tuple[str, Dict[str, Any]]:
@@ -229,6 +253,13 @@ Lembre-se:
 # ----------------------------------------------------------------
 
 
+def enforce_sql_limits(sql: str) -> str:
+    s = sql.strip().lower()
+    if s.startswith("select *") and " limit " not in s:
+        return sql.rstrip(" ;") + " LIMIT 500;"
+    return sql
+
+
 def db_mcp_tool(sql: str, params: Dict[str, Any]) -> list[Dict[str, Any]]:
     """
     Esta função encapsula a chamada ao banco e representa,
@@ -247,12 +278,19 @@ def generate_answer_with_llm(question: str, sql: str, rows: list[Dict[str, Any]]
     """
     Usa o LLM para transformar o resultado da query em uma resposta de negócio.
 
-    rows: lista de linhas retornadas pela SQL (cada linha é um dict).
-    Pode estar vazia (nenhum resultado), ter uma linha (agregação)
-    ou várias linhas (lista, top N, etc.).
+    Para evitar estouro de contexto, só mandamos um subconjunto das linhas
+    e informamos o total de registros encontrados.
     """
     if not USE_LLM:
         raise RuntimeError("LLM não configurado (OPENAI_API_KEY ausente).")
+
+    total_rows = len(rows)
+
+    # Limite de linhas que vamos mandar para o modelo
+    MAX_ROWS_FOR_LLM = 100
+    truncated_rows = rows[:MAX_ROWS_FOR_LLM]
+
+    rows_json = json.dumps(truncated_rows, default=str, ensure_ascii=False)
 
     system_prompt = """
 Você é um assistente de negócios que explica resultados de consultas SQL
@@ -261,19 +299,21 @@ sobre uma tabela de faturamento.
 Você recebe:
 - a pergunta original do usuário (em português),
 - a SQL que foi executada em um banco PostgreSQL,
-- o resultado dessa SQL em formato JSON (lista de linhas, cada linha é um objeto).
+- o resultado dessa SQL em formato JSON (APENAS UMA AMOSTRA das linhas),
+- o total de linhas retornadas pela SQL.
 
 Seu trabalho:
 - Interpretar a pergunta e o resultado.
-- Se a pergunta pede totais, use os campos numéricos agregados (por exemplo, SUM).
-- Se a pergunta pede listas (como "cinco maiores notas"), descreva os principais itens.
+- Usar principalmente campos numéricos e de negócio (por exemplo valores,
+  datas, status, cliente) para construir a análise.
+- Se a pergunta pede totais, fale de totais e médias (quando fizer sentido).
+- Se houver muitas linhas (total_linhas >> amostra), faça um resumo agregado:
+  por exemplo, total do período, quantidade de notas, médias por cliente ou status, etc.
 - Se a lista estiver vazia, explique que não há dados que atendam ao filtro.
-- Monte uma resposta em português, clara e curta (2 a 5 frases no máximo).
+- Monte uma resposta em português, clara e objetiva (2 a 6 frases).
 - Não repita a SQL na resposta final.
 - Não use markdown, apenas texto simples.
 """.strip()
-
-    rows_json = json.dumps(rows, default=str, ensure_ascii=False)
 
     user_prompt = f"""
 Pergunta do usuário:
@@ -282,10 +322,16 @@ Pergunta do usuário:
 SQL executada:
 {sql}
 
-Resultado da SQL (JSON - lista de linhas):
+Total de linhas retornadas pela SQL: {total_rows}
+Quantidade de linhas na amostra enviada ao modelo: {len(truncated_rows)}
+
+Resultado da SQL (amostra em JSON - lista de linhas):
 {rows_json}
 
-Com base nisso, responda ao usuário de forma objetiva, em português.
+Com base nisso, responda ao usuário de forma objetiva, em português,
+resumindo o que aconteceu nesse conjunto de dados. Se fizer sentido,
+mencione volume de notas, valores relevantes, status (pago, aberto, vencido)
+e qualquer padrão importante que apareça na amostra.
 """.strip()
 
     chat = client.chat.completions.create(
@@ -306,9 +352,9 @@ def build_answer(question: str, rows: list[Dict[str, Any]], sql: str) -> str:
     Fallback bem genérico, usado só se a LLM de resposta falhar.
     """
     return (
-        f"Para a pergunta '{question}', obtive {len(rows)} linha(s) como resultado. "
-        f"Primeiras linhas: {rows[:3]}. "
-        f"(SQL usada: {sql})"
+        "Desculpe, o módulo de IA não está disponível no momento, "
+        "então não consigo gerar uma resposta baseada nos seus dados. "
+        "Tente novamente mais tarde ou habilite a OPENAI_API_KEY."
     )
 
 
@@ -336,6 +382,13 @@ def run_agent(req: AskRequest):
     # 1) Gera SQL a partir da pergunta
     try:
         sql, params = decide_sql(req.question)
+        sql = enforce_sql_limits(sql)
+        if not is_safe_sql(sql):
+            raise HTTPException(
+                status_code=400,
+                detail="A consulta gerada pela IA foi considerada insegura."
+            )
+        rows = db_mcp_tool(sql, params)
     except Exception as e:
         raise HTTPException(
             status_code=500,
