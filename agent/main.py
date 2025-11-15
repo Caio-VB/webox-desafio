@@ -1,20 +1,21 @@
 import os
+import re
 import json
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 
-# --- Configuração de banco (tool MCP de banco, na prática) ---
+# ============================================================
+# Configuração básica
+# ============================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL não configurada no ambiente.")
 
 engine = create_engine(DATABASE_URL)
-
-# --- LLM (OpenAI) para geração de SQL e respostas ---
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 USE_LLM = bool(OPENAI_API_KEY)
@@ -36,16 +37,20 @@ class AgentResponse(BaseModel):
     debug_sql: str | None = None
 
 
-# ----------------------------------------------------------------
-# Camada de introspecção do banco
-# ----------------------------------------------------------------
+# Limites de segurança / contexto
+MAX_COLS = 30
+MAX_ROWS = 100
+MAX_SQL_ATTEMPTS = 3
+MAX_ROWS_FOR_LLM = MAX_ROWS
+
+Row = Dict[str, Any]
 
 
-def get_table_schema(table_name: str = "faturamento") -> list[dict]:
-    """
-    Lê o schema real da tabela no Postgres (colunas e tipos).
-    Não assume nada além do nome da tabela.
-    """
+# ============================================================
+# Introspecção do banco (schema + exemplos)
+# ============================================================
+
+def get_table_schema(table_name: str = "faturamento") -> List[Dict[str, str]]:
     sql = text(
         """
         SELECT column_name, data_type
@@ -61,24 +66,11 @@ def get_table_schema(table_name: str = "faturamento") -> list[dict]:
 
 def get_column_samples(
     table_name: str,
-    schema: list[dict],
+    schema: List[Dict[str, str]],
     max_samples: int = 5,
-) -> dict[str, list[str]]:
-    """
-    Para cada coluna textual, busca alguns valores distintos
-    para dar contexto ao LLM.
-
-    Não assume nomes específicos de colunas (status, cliente, etc.);
-    tudo vem do schema real.
-    """
-    samples: dict[str, list[str]] = {}
-
-    text_types = {
-        "character varying",
-        "text",
-        "varchar",
-        "char",
-    }
+) -> Dict[str, List[str]]:
+    samples: Dict[str, List[str]] = {}
+    text_types = {"character varying", "text", "varchar", "char"}
 
     with engine.begin() as conn:
         for col in schema:
@@ -88,7 +80,6 @@ def get_column_samples(
             if col_type not in text_types:
                 continue
 
-            # col_name vem do information_schema, não de input do usuário.
             sql = text(
                 f"""
                 SELECT DISTINCT "{col_name}"
@@ -106,58 +97,72 @@ def get_column_samples(
     return samples
 
 
-# ----------------------------------------------------------------
-# Camada de decisão de SQL
-# ----------------------------------------------------------------
-
-
-DANGEROUS_KEYWORDS = [
-    "insert", "update", "delete", "drop", "alter",
-    "truncate", "create", "grant", "revoke", "execute", "copy"
-]
+# ============================================================
+# Helpers de SQL
+# ============================================================
 
 def is_safe_sql(sql: str) -> bool:
+    """
+    Regra simples: só aceita SELECT (guard-rail extra).
+    """
     s = sql.strip().lower()
-
-    # só permite SELECT
-    if not s.startswith("select"):
-        return False
-
-    # só uma instrução (no máximo um ';' no final)
-    if ";" in s[:-1]:
-        return False
-
-    # corta comentários pra não esconder coisa
-    for kw in DANGEROUS_KEYWORDS:
-        if kw in s:
-            return False
-
-    return True
+    return s.startswith("select")
 
 
-
-def decide_sql(question: str) -> Tuple[str, Dict[str, Any]]:
+def analyze_sql_shape(sql: str) -> Tuple[bool, bool, int | None]:
     """
-    Usa um LLM (OpenAI) para gerar SQL a partir da pergunta.
+    Analisa a forma da query:
 
-    Não assume nomes específicos de colunas de negócio.
-    Em vez disso:
-      - lê o schema real da tabela de faturamento (todas as colunas),
-      - lê alguns valores de exemplo para colunas textuais,
-      - passa isso tudo para o LLM escolher quais colunas/valores usar.
+    - has_aggregate: True se parecer agregada (SUM/AVG/COUNT/MIN/MAX ou GROUP BY)
+    - has_limit: True se há LIMIT
+    - limit_value: valor numérico do LIMIT, se existir
     """
+    s = sql.lower()
+    has_aggregate_fn = bool(re.search(r"\b(sum|avg|count|min|max)\s*\(", s))
+    has_group_by = "group by" in s
+    has_aggregate = has_aggregate_fn or has_group_by
+
+    m = re.search(r"\blimit\s+(\d+)", s)
+    has_limit = m is not None
+    limit_value = int(m.group(1)) if m else None
+
+    return has_aggregate, has_limit, limit_value
+
+
+def normalize_sql_for_postgres(sql: str) -> str:
+    """
+    Corrige 'GROUP BY ... WITH ROLLUP' (MySQL) para 'GROUP BY ROLLUP (...)' (Postgres).
+    """
+
+    def repl_rollup(match: re.Match) -> str:
+        cols = match.group(1).strip().rstrip(",")
+        return f"GROUP BY ROLLUP ({cols})"
+
+    pattern_rollup = re.compile(
+        r"group\s+by\s+([a-zA-Z0-9_\",.\s]+?)\s+with\s+rollup",
+        re.IGNORECASE,
+    )
+    fixed = pattern_rollup.sub(repl_rollup, sql)
+    return fixed
+
+
+# ============================================================
+# Geração de SQL via LLM
+# ============================================================
+
+def decide_sql(
+    question: str,
+    previous_sql: str | None = None,
+    previous_issue: str | None = None,
+) -> Tuple[str, Dict[str, Any]]:
     if not USE_LLM:
         raise RuntimeError("LLM não configurado (OPENAI_API_KEY ausente).")
 
     table_name = os.getenv("FATURAMENTO_TABLE", "faturamento")
 
-    # 1) Schema real da tabela
     schema = get_table_schema(table_name)
-
-    # 2) Amostras de valores das colunas textuais
     samples = get_column_samples(table_name, schema, max_samples=5)
 
-    # 3) Monta descrição para o prompt
     col_lines = []
     for col in schema:
         name = col["name"]
@@ -173,56 +178,58 @@ def decide_sql(question: str) -> Tuple[str, Dict[str, Any]]:
     system_prompt = """
 Você é um assistente que gera consultas SQL para um banco PostgreSQL.
 
-Você tem acesso a UMA tabela principal que representa dados de faturamento
-consolidados a partir de arquivos Excel.
+REGRAS MUITO IMPORTANTES (NÃO QUEBRE):
 
-Regras MUITO IMPORTANTES (NÃO QUEBRE):
+1) Use APENAS a tabela informada pelo sistema.
+2) Use APENAS as colunas listadas no esquema.
+3) Use APENAS valores de texto que apareçam nas amostras fornecidas.
+4) Use colunas numéricas adequadas para valores (ex.: com 'valor', 'total').
+5) Use colunas de status/situação para títulos em aberto/pago/vencido.
+6) Não invente colunas nem valores.
+7) NÃO use SELECT *; selecione apenas as colunas necessárias.
+8) NÃO use DELETE, UPDATE, INSERT ou DDL; apenas SELECT.
+9) A consulta NÃO pode retornar mais do que 30 colunas.
+10) A consulta NÃO pode retornar mais do que 100 linhas.
+11) Para relatórios ou períodos amplos (ano, mês), PREFIRA consultas AGREGADAS
+    (GROUP BY, SUM, COUNT, AVG).
+12) Use APENAS sintaxe PostgreSQL. Para totais:
+    - Use GROUP BY ROLLUP (...) ou GROUPING SETS.
+    - NUNCA use 'WITH ROLLUP' nem 'WITH CUBE'.
+13) Responda APENAS com a SQL, sem explicações, sem markdown.
+""".strip()
 
-1) NÃO invente nomes de tabelas. Use APENAS a tabela informada pelo sistema.
-2) NÃO invente nomes de colunas. Use APENAS as colunas listadas no esquema.
-3) Para filtrar por valores de texto (por exemplo, status, situação, cliente),
-   use APENAS valores que apareçam nas amostras fornecidas pelo sistema.
-   - Copie o valor exatamente como está:
-     * mesmas maiúsculas/minúsculas,
-     * mesmos underscores,
-     * sem traduzir, sem “normalizar”.
-   - Exemplo: se o valor de exemplo é "EM_ABERTO", use exatamente 'EM_ABERTO'.
-4) Para perguntas sobre "quanto eu faturei", "total faturado", etc.,
-   escolha uma coluna NUMÉRICA adequada com base no nome e nos exemplos.
-   Exemplo: colunas cujos nomes contenham "valor", "total", "faturamento".
-5) Para perguntas sobre "quanto tenho a receber" ou "em aberto",
-   escolha uma coluna TEXTUAL de status/situação e valores que representem
-   "não pago / em aberto / pendente", COM BASE nas amostras fornecidas.
-6) Se a pergunta mencionar um cliente ou identificador (ex.: "XPTO"),
-   e houver uma coluna textual compatível com isso (pelo nome ou pelos valores),
-   use essa coluna em um WHERE apropriado.
-7) Se você NÃO encontrar colunas/valores suficientes para responder,
-   NÃO invente nada. Nesse caso, gere uma SQL exploratória que ajude
-   o usuário a entender os dados, por exemplo:
-   - SELECT DISTINCT alguma_coluna FROM tabela;
-   - ou uma agregação simples por colunas relevantes.
-8) Não use SELECT *; selecione apenas as colunas necessárias.
-9) Não use DELETE, UPDATE ou INSERT; apenas SELECT.
-10) Responda APENAS com a SQL, sem explicações, sem markdown.
+    feedback_block = ""
+    if previous_sql and previous_issue:
+        feedback_block = f"""
+A consulta SQL ANTERIOR foi:
+
+{previous_sql}
+
+Problema detectado:
+{previous_issue}
+
+Gere AGORA uma NOVA consulta que:
+- respeite os limites (≤ 30 colunas, ≤ 100 linhas),
+- responda à mesma pergunta do usuário,
+- use agregações quando houver muitas linhas,
+- use apenas sintaxe válida de PostgreSQL.
 """.strip()
 
     user_prompt = f"""
-A tabela disponível se chama {table_name}.
+Tabela disponível: {table_name}.
 
 Esquema da tabela (colunas, tipos e exemplos de valores):
 
 {schema_description}
 
-Pergunta do usuário:
+Pergunta (subpergunta) do usuário:
 {question}
 
-Com base SOMENTE nas colunas listadas acima e nos valores de exemplo
-informados, gere uma única consulta SQL em PostgreSQL que responda à pergunta.
+{feedback_block}
 
-Lembre-se:
-- não invente colunas;
-- não invente valores: use apenas os exemplos fornecidos (quando precisar filtrar);
-- se não houver informação suficiente, gere uma SQL exploratória útil.
+Com base SOMENTE nas colunas listadas e exemplos fornecidos,
+gere uma ÚNICA consulta SQL em PostgreSQL que responda à pergunta
+e respeite os limites de no máximo 30 colunas e 100 linhas.
 """.strip()
 
     chat = client.chat.completions.create(
@@ -235,7 +242,7 @@ Lembre-se:
     )
     sql = chat.choices[0].message.content.strip()
 
-    # Sanitização (``` etc.)
+    # Sanitização de bloco ```sql ... ```
     if sql.startswith("```"):
         lines = sql.splitlines()
         if lines:
@@ -248,71 +255,212 @@ Lembre-se:
     return sql, params
 
 
-# ----------------------------------------------------------------
-# Camada "tool" de banco (pensar como uma MCP tool)
-# ----------------------------------------------------------------
+# ============================================================
+# Plano de análise (fixo para relatórios de ano)
+# ============================================================
 
+def build_fixed_plan_for_question(question: str) -> List[Dict[str, Any]]:
+    """
+    Para perguntas claramente de relatório/ano, monta 3 subperguntas.
+    Caso contrário, apenas 1 subpergunta igual à pergunta (pergunta simples).
+    """
+    q_lower = question.lower()
+
+    mentions_report = "relatório" in q_lower or "relatorio" in q_lower
+    broad_how_was = "como foi" in q_lower
+    mentions_year = re.search(r"\b20\d{2}\b", q_lower) is not None
+
+    is_year_report = mentions_report or (broad_how_was and mentions_year)
+
+    if not is_year_report:
+        return [{
+            "id": "q1",
+            "title": "Pergunta principal",
+            "question": question,
+            "goal": "Responder diretamente à pergunta do usuário"
+        }]
+
+    # Para relatório de ano, 3 subperguntas estratégias (todas agregadas)
+    return [
+        {
+            "id": "q1",
+            "title": "Visão geral mensal do faturamento",
+            "question": (
+                "Calcule, para o ano de 2024, o faturamento total por mês, "
+                "incluindo quantidade de notas, soma de valor_bruto, soma de valor_liquido, "
+                "soma de valor_imposto e ticket_medio_estimado médio por mês."
+            ),
+            "goal": "Entender a evolução mensal do faturamento em 2024."
+        },
+        {
+            "id": "q2",
+            "title": "Faturamento por status do título",
+            "question": (
+                "Para o ano de 2024, agrupe por status_titulo e retorne, por status, "
+                "a quantidade de notas e a soma de valor_liquido."
+            ),
+            "goal": "Entender quanto está faturado por status (pago, aberto, vencido, etc.)."
+        },
+        {
+            "id": "q3",
+            "title": "Faturamento por cluster ou segmento de cliente",
+            "question": (
+                "Para o ano de 2024, agrupe por cluster_cliente ou segmento_cliente "
+                "(o que existir na tabela) e retorne a quantidade de notas e a soma de valor_liquido. "
+                "Se existirem as duas colunas, prefira agrupar por cluster_cliente."
+            ),
+            "goal": "Entender concentração de receita por perfil de cliente em 2024."
+        },
+    ]
+
+
+# ============================================================
+# Execução de SQL
+# ============================================================
 
 def enforce_sql_limits(sql: str) -> str:
-    s = sql.strip().lower()
-    if s.startswith("select *") and " limit " not in s:
-        return sql.rstrip(" ;") + " LIMIT 500;"
-    return sql
+    sql_clean = sql.strip().rstrip(";")
+    s_lower = sql_clean.lower()
+
+    if re.search(r"\blimit\b", s_lower):
+        return sql_clean + ";"
+
+    return sql_clean + f" LIMIT {MAX_ROWS};"
 
 
-def db_mcp_tool(sql: str, params: Dict[str, Any]) -> list[Dict[str, Any]]:
-    """
-    Esta função encapsula a chamada ao banco e representa,
-    conceitualmente, uma tool de banco de dados no MCP/A2A.
-
-    Em um cenário com MCP, esta função seria a implementação
-    da "ferramenta de banco", e o agente chamaria essa tool.
-    """
+def db_mcp_tool(sql: str, params: Dict[str, Any]) -> List[Row]:
     with engine.begin() as conn:
         result = conn.execute(text(sql), params)
         rows = result.mappings().all()
     return [dict(r) for r in rows]
 
 
-def generate_answer_with_llm(question: str, sql: str, rows: list[Dict[str, Any]]) -> str:
-    """
-    Usa o LLM para transformar o resultado da query em uma resposta de negócio.
+def plan_and_run_sql_with_limits(question: str) -> Tuple[str, List[Row]]:
+    previous_sql: str | None = None
+    previous_issue: str | None = None
 
-    Para evitar estouro de contexto, só mandamos um subconjunto das linhas
-    e informamos o total de registros encontrados.
+    for _ in range(1, MAX_SQL_ATTEMPTS + 1):
+        sql, params = decide_sql(question, previous_sql, previous_issue)
+        sql = normalize_sql_for_postgres(sql)
+        sql = enforce_sql_limits(sql)
+
+        if not is_safe_sql(sql):
+            raise HTTPException(
+                status_code=400,
+                detail="A consulta gerada pela IA foi considerada insegura."
+            )
+
+        has_aggregate, has_limit, limit_value = analyze_sql_shape(sql)
+        rows = db_mcp_tool(sql, params)
+
+        num_rows = len(rows)
+        num_cols = len(rows[0]) if rows else 0
+
+        # Se não é agregada, tem LIMIT e bateu exatamente o teto: provavelmente amostra
+        if (not has_aggregate) and has_limit and num_rows == MAX_ROWS:
+            previous_sql = sql
+            previous_issue = (
+                "a consulta retornou 100 linhas de detalhe usando LIMIT, "
+                "provavelmente como amostra de um conjunto maior. "
+                "Gere agora uma consulta AGREGADA (GROUP BY com SUM/COUNT/AVG, etc.) "
+                "que responda a mesma pergunta sem depender de amostra."
+            )
+            continue
+
+        if num_rows <= MAX_ROWS and num_cols <= MAX_COLS:
+            return sql, rows
+
+        previous_sql = sql
+        previous_issue = (
+            f"A consulta retornou {num_cols} colunas e {num_rows} linhas (resultado muito grande). "
+            "Gere uma nova consulta MAIS AGREGADA e com MENOS colunas, "
+            "respeitando o limite de no máximo 30 colunas e 100 linhas."
+        )
+
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            "Não foi possível gerar uma consulta SQL que respeitasse o limite "
+            "de no máximo 30 colunas e 100 linhas após várias tentativas."
+        ),
+    )
+
+
+def run_analysis_pipeline(question: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Usa plano fixo:
+    - Se pergunta simples => 1 subpergunta (a própria pergunta).
+    - Se pergunta de relatório de ano => 3 subperguntas estratégicas.
+    """
+    plan = build_fixed_plan_for_question(question)
+    query_results: List[Dict[str, Any]] = []
+
+    for item in plan:
+        sub_q = item.get("question") or question
+        try:
+            sql, rows = plan_and_run_sql_with_limits(sub_q)
+            query_results.append({
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "goal": item.get("goal"),
+                "subquestion": sub_q,
+                "sql": sql,
+                "total_rows": len(rows),
+                "rows": rows,
+                "error": None,
+            })
+        except HTTPException as e:
+            query_results.append({
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "goal": item.get("goal"),
+                "subquestion": sub_q,
+                "sql": None,
+                "total_rows": 0,
+                "rows": [],
+                "error": str(e.detail),
+            })
+
+    if all(r["error"] is not None for r in query_results):
+        raise HTTPException(
+            status_code=500,
+            detail="Nenhuma consulta SQL pôde ser executada com sucesso para o plano de análise.",
+        )
+
+    return plan, query_results
+
+
+# ============================================================
+# Respostas em linguagem natural
+# ============================================================
+
+def generate_simple_answer_with_llm(question: str, sql: str, rows: List[Row]) -> str:
+    """
+    Para perguntas simples (apenas 1 subquery): resposta direta, curta.
+    Sempre usando apenas os valores retornados pelo banco.
     """
     if not USE_LLM:
         raise RuntimeError("LLM não configurado (OPENAI_API_KEY ausente).")
 
     total_rows = len(rows)
-
-    # Limite de linhas que vamos mandar para o modelo
-    MAX_ROWS_FOR_LLM = 100
     truncated_rows = rows[:MAX_ROWS_FOR_LLM]
-
     rows_json = json.dumps(truncated_rows, default=str, ensure_ascii=False)
 
     system_prompt = """
-Você é um assistente de negócios que explica resultados de consultas SQL
-sobre uma tabela de faturamento.
+Você é um assistente de negócios que responde perguntas objetivas
+sobre resultados de consultas SQL de faturamento.
 
-Você recebe:
-- a pergunta original do usuário (em português),
-- a SQL que foi executada em um banco PostgreSQL,
-- o resultado dessa SQL em formato JSON (APENAS UMA AMOSTRA das linhas),
-- o total de linhas retornadas pela SQL.
+REGRAS:
 
-Seu trabalho:
-- Interpretar a pergunta e o resultado.
-- Usar principalmente campos numéricos e de negócio (por exemplo valores,
-  datas, status, cliente) para construir a análise.
-- Se a pergunta pede totais, fale de totais e médias (quando fizer sentido).
-- Se houver muitas linhas (total_linhas >> amostra), faça um resumo agregado:
-  por exemplo, total do período, quantidade de notas, médias por cliente ou status, etc.
-- Se a lista estiver vazia, explique que não há dados que atendam ao filtro.
-- Monte uma resposta em português, clara e objetiva (2 a 6 frases).
-- Não repita a SQL na resposta final.
-- Não use markdown, apenas texto simples.
+1) NÃO invente números. Use APENAS os valores numéricos que aparecem
+   nas linhas do JSON.
+2) NÃO crie totais que não estejam explicitamente em alguma linha/coluna.
+3) Se a SQL já traz um total (ex.: soma, count, etc.), você pode usá-lo.
+4) Se os dados estiverem agregados por mês/cliente/etc., responda usando
+   esses valores (por exemplo, maior mês, menor mês), SEM inventar valor
+   adicional.
+5) Responda em no máximo 3 frases, em português, bem direto ao ponto.
+6) Não repita a SQL. Não use markdown.
 """.strip()
 
     user_prompt = f"""
@@ -323,15 +471,13 @@ SQL executada:
 {sql}
 
 Total de linhas retornadas pela SQL: {total_rows}
-Quantidade de linhas na amostra enviada ao modelo: {len(truncated_rows)}
+Quantidade de linhas enviadas ao modelo: {len(truncated_rows)}
 
-Resultado da SQL (amostra em JSON - lista de linhas):
+Resultado da SQL (lista de linhas em JSON):
 {rows_json}
 
-Com base nisso, responda ao usuário de forma objetiva, em português,
-resumindo o que aconteceu nesse conjunto de dados. Se fizer sentido,
-mencione volume de notas, valores relevantes, status (pago, aberto, vencido)
-e qualquer padrão importante que apareça na amostra.
+Responda de forma direta e curta à pergunta do usuário,
+usando apenas os números presentes nos dados acima.
 """.strip()
 
     chat = client.chat.completions.create(
@@ -347,30 +493,95 @@ e qualquer padrão importante que apareça na amostra.
     return answer
 
 
-def build_answer(question: str, rows: list[Dict[str, Any]], sql: str) -> str:
-    """
-    Fallback bem genérico, usado só se a LLM de resposta falhar.
-    """
+def generate_report_with_llm(
+    question: str,
+    plan: List[Dict[str, Any]],
+    query_results: List[Dict[str, Any]],
+) -> str:
+    if not USE_LLM:
+        raise RuntimeError("LLM não configurado (OPENAI_API_KEY ausente).")
+
+    payload = {
+        "user_question": question,
+        "plan": plan,
+        "queries": []
+    }
+
+    for qr in query_results:
+        rows = qr.get("rows") or []
+        payload["queries"].append({
+            "id": qr.get("id"),
+            "title": qr.get("title"),
+            "goal": qr.get("goal"),
+            "subquestion": qr.get("subquestion"),
+            "sql": qr.get("sql"),
+            "total_rows": qr.get("total_rows", len(rows)),
+            "rows": rows,
+            "error": qr.get("error"),
+        })
+
+    payload_json = json.dumps(payload, default=str, ensure_ascii=False)
+
+    system_prompt = """
+Você é um assistente de negócios que escreve RELATÓRIOS ESTRUTURADOS
+sobre faturamento, com base em resultados de consultas SQL.
+
+REGRAS:
+
+1) NÃO invente números. Use APENAS os valores numéricos presentes nas linhas.
+2) NÃO crie totais que não estejam em alguma linha da entrada.
+3) Se faltar número para algo, comente qualitativamente, sem chutar valor.
+4) Se alguma subpergunta tiver erro, mencione brevemente que aquela visão
+   não pôde ser analisada.
+5) Estruture como relatório em texto simples (sem markdown), por exemplo:
+   Visão geral, Análise por mês, Análise por status, Análise por cliente,
+   Conclusões.
+6) Escreva em português, tom profissional e objetivo.
+7) Entre 4 e 10 parágrafos.
+""".strip()
+
+    user_prompt = f"""
+Aqui está o PLANO de análise e os RESULTADOS das consultas em JSON:
+
+{payload_json}
+
+Tarefa:
+- Monte um RELATÓRIO estruturado, em português, que responda à pergunta
+  original do usuário:
+  "{question}"
+
+- Use apenas os números presentes nas linhas do JSON.
+- Não repita SQL.
+- Não use markdown.
+""".strip()
+
+    chat = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0,
+    )
+
+    answer = chat.choices[0].message.content.strip()
+    return answer
+
+
+def build_answer(question: str, plan_or_rows, query_results: List[Dict[str, Any]] | None = None) -> str:
     return (
-        "Desculpe, o módulo de IA não está disponível no momento, "
-        "então não consigo gerar uma resposta baseada nos seus dados. "
-        "Tente novamente mais tarde ou habilite a OPENAI_API_KEY."
+        "Os dados foram consultados no banco com sucesso, mas o módulo de IA "
+        "que gera a resposta em linguagem natural não está disponível no momento. "
+        "Tente novamente mais tarde."
     )
 
 
-# ----------------------------------------------------------------
+# ============================================================
 # Endpoint do agente
-# ----------------------------------------------------------------
-
+# ============================================================
 
 @app.post("/run-agent", response_model=AgentResponse)
 def run_agent(req: AskRequest):
-    """
-    Agent-service:
-    - recebe question
-    - se LLM estiver disponível, gera SQL e chama a "tool" de banco
-    - em seguida, usa o LLM novamente para traduzir o resultado em resposta de negócio
-    """
     if not USE_LLM:
         mensagem = (
             "Desculpe, o módulo de IA não está disponível no momento, "
@@ -379,36 +590,50 @@ def run_agent(req: AskRequest):
         )
         return AgentResponse(answer=mensagem, debug_sql=None)
 
-    # 1) Gera SQL a partir da pergunta
+    # 1) Monta plano (fixo) e executa as queries
     try:
-        sql, params = decide_sql(req.question)
-        sql = enforce_sql_limits(sql)
-        if not is_safe_sql(sql):
-            raise HTTPException(
-                status_code=400,
-                detail="A consulta gerada pela IA foi considerada insegura."
-            )
-        rows = db_mcp_tool(sql, params)
+        plan, query_results = run_analysis_pipeline(req.question)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Erro ao decidir SQL com o agente de IA: {e}",
+            detail=f"Erro no pipeline de análise com o agente de IA: {e}",
         )
 
-    # 2) Executa a SQL via tool de banco (MCP-like)
+    # 2) Escolhe se é resposta simples ou relatório
     try:
-        rows = db_mcp_tool(sql, params)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro ao executar SQL: {e}",
-        )
+        if len(plan) == 1:
+            # Pergunta simples => usa só a primeira query
+            qr = query_results[0]
+            if qr.get("error"):
+                raise HTTPException(status_code=500, detail=qr["error"])
+            sql = qr.get("sql")
+            rows = qr.get("rows") or []
+            answer = generate_simple_answer_with_llm(req.question, sql, rows)
+            debug_sql = sql
+        else:
+            # Pergunta ampla => relatório estruturado
+            answer = generate_report_with_llm(req.question, plan, query_results)
 
-    # 3) Usa LLM para gerar a resposta de negócio
-    try:
-        answer = generate_answer_with_llm(req.question, sql, rows)
+            debug_blocks: List[str] = []
+            for qr in query_results:
+                title = qr.get("title") or qr.get("id") or "subpergunta"
+                sql = qr.get("sql")
+                err = qr.get("error")
+                if sql:
+                    debug_blocks.append(f"-- {title}\n{sql}")
+                elif err:
+                    debug_blocks.append(f"-- {title} (erro)\n-- {err}")
+            debug_sql = "\n\n".join(debug_blocks) if debug_blocks else None
+
     except Exception as e:
         print(f"[AGENT] Erro ao gerar resposta com LLM, usando fallback: {e}")
-        answer = build_answer(req.question, rows, sql)
+        if len(plan) == 1:
+            answer = build_answer(req.question, query_results[0].get("rows") or [])
+            debug_sql = query_results[0].get("sql")
+        else:
+            answer = build_answer(req.question, plan, query_results)
+            debug_sql = None
 
-    return AgentResponse(answer=answer, debug_sql=sql)
+    return AgentResponse(answer=answer, debug_sql=debug_sql)
