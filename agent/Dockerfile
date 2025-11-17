@@ -7,6 +7,11 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# (Opcional, mas melhor) usar requirements.txt
+# COPY requirements.txt .
+# RUN pip install --no-cache-dir -r requirements.txt
+
+# Como você ainda não tem requirements.txt, mantém assim:
 RUN pip install --no-cache-dir \
     fastapi \
     "uvicorn[standard]" \
@@ -15,6 +20,7 @@ RUN pip install --no-cache-dir \
     psycopg2-binary \
     openai
 
-COPY main.py .
+# Copia TODOS os arquivos .py do projeto (main, config, db, etc.)
+COPY . .
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9000"]
