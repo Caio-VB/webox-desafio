@@ -2,10 +2,9 @@ import os
 from pathlib import Path
 
 # URL do banco
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg2://webox:weboxpass@localhost:5432/weboxdb",
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL não configurada no ambiente.")
 
 # Nome da tabela principal de faturamento
 TABLE_NAME = os.getenv("FATURAMENTO_TABLE", "faturamento")
