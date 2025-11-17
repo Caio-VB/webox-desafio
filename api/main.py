@@ -30,7 +30,7 @@ def ask(req: AskRequest):
     O agent-service é quem decide SQL, consulta o banco e monta a resposta.
     """
     try:
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=200.0) as client:
             resp = client.post(
                 AGENT_URL,
                 json=req.model_dump(),
