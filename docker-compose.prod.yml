@@ -1,0 +1,57 @@
+services:
+  db:
+    image: caiobrandao/webox-db:latest
+    container_name: webox-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  etl:
+    image: caiobrandao/webox-etl:latest
+    container_name: webox-etl
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      INBOX_DIR: ${ETL_INBOX_DIR}
+      CLIENTE_ID: ${ETL_CLIENTE_ID}
+      POLL_INTERVAL: "${ETL_POLL_INTERVAL}"
+    volumes:
+      - ./data/inbox:/data/inbox
+    restart: unless-stopped
+
+  agent:
+    image: caiobrandao/webox-agent:latest
+    container_name: webox-agent
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    ports:
+      - "9000:9000"
+    restart: unless-stopped
+
+  api:
+    image: caiobrandao/webox-api:latest
+    container_name: webox-api
+    depends_on:
+      - agent
+    environment:
+      AGENT_URL: ${AGENT_URL}
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+volumes:
+  db_data:
