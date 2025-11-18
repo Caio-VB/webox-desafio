@@ -164,7 +164,7 @@ REGRAS NUMÉRICAS (MUITO IMPORTANTES):
      "faturamento total do ano foi X", a menos que exista uma linha explícita
      com esse total anual.
 3) Você pode:
-   - repetir números exatamente como aparecem nas linhas;
+   - repetir números exatamente como aparecem nas linhas, mas tratando quando nescessário, por exmplo quando for moeda;
    - comparar qualitativamente (ex.: "setembro foi o maior mês entre os listados");
    - citar valores de colunas agregadas já prontas (ex.: uma coluna chamada
      faturamento_bruto_total, faturamento_liquido_total, etc.).
